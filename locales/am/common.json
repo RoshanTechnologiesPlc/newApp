@@ -1,0 +1,17 @@
+{
+  "common": {
+    "matches": "ጨዋታዎች",
+    "leagues": "ሊጎች",
+    "news": "ዜና",
+    "standings": "ደረጃ",
+    "today": "ዛሬ",
+    "live": "በቀጥታ",
+    "finished": "ተጠናቀቀ",
+    "upcoming": "የሚቀጥሉ",
+    "pos": "ደረጃ",
+    "team": "ቡድን",
+    "played": "ተ",
+    "points": "ነጥብ",
+    "home": "መነሻ"
+  }
+}
