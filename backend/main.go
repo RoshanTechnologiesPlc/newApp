@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/gocolly/colly/v2"
@@ -26,15 +27,32 @@ type News struct {
 var db *pgx.Conn
 
 func main() {
-	// Initialize DB connection
+	// Initialize DB connection with retries
 	var err error
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
 		log.Println("DATABASE_URL is not set, skipping DB connection for now")
 	} else {
-		db, err = pgx.Connect(context.Background(), dbURL)
+		// Ensure sslmode=require for Render Postgres
+		if !strings.Contains(dbURL, "sslmode=") {
+			if strings.Contains(dbURL, "?") {
+				dbURL += "&sslmode=require"
+			} else {
+				dbURL += "?sslmode=require"
+			}
+		}
+
+		for i := 0; i < 5; i++ {
+			db, err = pgx.Connect(context.Background(), dbURL)
+			if err == nil {
+				break
+			}
+			log.Printf("Failed to connect to database (attempt %d): %v", i+1, err)
+			time.Sleep(5 * time.Second)
+		}
+
 		if err != nil {
-			log.Fatal("Unable to connect to database:", err)
+			log.Fatal("Could not connect to database after retries:", err)
 		}
 		defer db.Close(context.Background())
 
@@ -120,7 +138,8 @@ func getNews(w http.ResponseWriter, r *http.Request) {
 func runScraper() {
 	log.Println("Starting scraper...")
 	fp := gofeed.NewParser()
-	// Soccer news in Amharic
+
+	// Trying soccer news in Amharic first
 	feed, err := fp.ParseURL("https://news.google.com/rss/search?q=soccer&hl=am&gl=ET&ceid=ET:am")
 	if err != nil {
 		log.Println("Amharic feed failed, trying English:", err)
@@ -131,6 +150,7 @@ func runScraper() {
 		}
 	}
 
+	log.Printf("Found %d items in RSS feed.", len(feed.Items))
 	for _, item := range feed.Items {
 		scrapeAndStore(item)
 	}
@@ -153,7 +173,7 @@ func scrapeAndStore(item *gofeed.Item) {
 
 	c.OnHTML("article", func(e *colly.HTMLElement) {
 		if content == "" {
-			content = e.Text
+			content = strings.TrimSpace(e.Text)
 		}
 	})
 
@@ -165,7 +185,7 @@ func scrapeAndStore(item *gofeed.Item) {
 
 	c.OnHTML("p", func(e *colly.HTMLElement) {
 		if len(content) < 2000 {
-			content += e.Text + " "
+			content += strings.TrimSpace(e.Text) + " "
 		}
 	})
 
@@ -175,7 +195,7 @@ func scrapeAndStore(item *gofeed.Item) {
 	}
 
 	if content == "" {
-		content = item.Description
+		content = strings.TrimSpace(item.Description)
 	}
 
 	_, err = db.Exec(context.Background(),
