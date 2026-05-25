@@ -2,16 +2,18 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/gocolly/colly/v2"
-	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mmcdole/gofeed"
 )
 
@@ -24,40 +26,66 @@ type News struct {
 	CreatedAt    time.Time `json:"created_at"`
 }
 
-var db *pgx.Conn
+var pool *pgxpool.Pool
 
 func main() {
 	// Initialize DB connection with retries
-	var err error
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
 		log.Println("DATABASE_URL is not set, skipping DB connection for now")
 	} else {
-		// Ensure sslmode=require for Render Postgres
+		// Robustly ensure sslmode=require for Render Postgres
 		if !strings.Contains(dbURL, "sslmode=") {
 			if strings.Contains(dbURL, "?") {
 				dbURL += "&sslmode=require"
 			} else {
 				dbURL += "?sslmode=require"
 			}
+		} else {
+			dbURL = strings.Replace(dbURL, "sslmode=disable", "sslmode=require", 1)
 		}
 
-		for i := 0; i < 5; i++ {
-			db, err = pgx.Connect(context.Background(), dbURL)
+		config, err := pgxpool.ParseConfig(dbURL)
+		if err != nil {
+			log.Fatalf("Unable to parse DATABASE_URL: %v", err)
+		}
+
+		// Explicitly configure TLS to be more resilient on Render
+		if config.ConnConfig.TLSConfig == nil {
+			config.ConnConfig.TLSConfig = &tls.Config{}
+		}
+		config.ConnConfig.TLSConfig.InsecureSkipVerify = true
+
+		// Set connection pool settings for stability
+		config.MaxConns = 10
+		config.MinConns = 2
+		config.MaxConnLifetime = 1 * time.Hour
+		config.MaxConnIdleTime = 30 * time.Minute
+
+		log.Printf("Connecting to database at %s", maskPassword(dbURL))
+
+		for i := 0; i < 10; i++ {
+			pool, err = pgxpool.NewWithConfig(context.Background(), config)
 			if err == nil {
-				break
+				err = pool.Ping(context.Background())
+				if err == nil {
+					break
+				}
 			}
 			log.Printf("Failed to connect to database (attempt %d): %v", i+1, err)
+			if pool != nil {
+				pool.Close()
+			}
 			time.Sleep(5 * time.Second)
 		}
 
 		if err != nil {
 			log.Fatal("Could not connect to database after retries:", err)
 		}
-		defer db.Close(context.Background())
+		defer pool.Close()
 
 		// Auto-migrate: Create table
-		_, err = db.Exec(context.Background(), `
+		_, err = pool.Exec(context.Background(), `
 			CREATE TABLE IF NOT EXISTS news (
 				id SERIAL PRIMARY KEY,
 				title TEXT NOT NULL,
@@ -74,15 +102,12 @@ func main() {
 	}
 
 	// Start background scraper
-	if db != nil {
+	if pool != nil {
 		go startScheduledScraper()
 	}
 
 	http.HandleFunc("/api/news", getNews)
-	http.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
-	})
+	http.HandleFunc("/api/health", healthCheck)
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -90,6 +115,38 @@ func main() {
 	}
 	fmt.Printf("Server starting on port %s...\n", port)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
+}
+
+func maskPassword(dsn string) string {
+	u, err := url.Parse(dsn)
+	if err != nil {
+		return "invalid-url"
+	}
+	if u.User != nil {
+		_, hasPassword := u.User.Password()
+		if hasPassword {
+			u.User = url.UserPassword(u.User.Username(), "****")
+		}
+	}
+	return u.String()
+}
+
+func healthCheck(w http.ResponseWriter, r *http.Request) {
+	status := "OK"
+	dbStatus := "Connected"
+	if pool == nil {
+		dbStatus = "Not Configured"
+	} else if err := pool.Ping(context.Background()); err != nil {
+		dbStatus = "Disconnected: " + err.Error()
+		status = "Error"
+		w.WriteHeader(http.StatusInternalServerError)
+	}
+
+	json.NewEncoder(w).Encode(map[string]string{
+		"status":   status,
+		"database": dbStatus,
+		"time":     time.Now().Format(time.RFC3339),
+	})
 }
 
 func startScheduledScraper() {
@@ -107,12 +164,12 @@ func getNews(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
-	if db == nil {
+	if pool == nil {
 		json.NewEncoder(w).Encode([]News{})
 		return
 	}
 
-	rows, err := db.Query(context.Background(), "SELECT id, title, COALESCE(content, ''), COALESCE(image_url, ''), publisher_url, created_at FROM news ORDER BY created_at DESC LIMIT 20")
+	rows, err := pool.Query(context.Background(), "SELECT id, title, COALESCE(content, ''), COALESCE(image_url, ''), publisher_url, created_at FROM news ORDER BY created_at DESC LIMIT 20")
 	if err != nil {
 		log.Println("Query error:", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -139,10 +196,13 @@ func runScraper() {
 	log.Println("Starting scraper...")
 	fp := gofeed.NewParser()
 
-	// Trying soccer news in Amharic first
-	feed, err := fp.ParseURL("https://news.google.com/rss/search?q=soccer&hl=am&gl=ET&ceid=ET:am")
-	if err != nil {
-		log.Println("Amharic feed failed, trying English:", err)
+	// Soccer news in Amharic (እግር ኳስ)
+	amharicQuery := url.QueryEscape("እግር ኳስ")
+	feedURL := fmt.Sprintf("https://news.google.com/rss/search?q=%s&hl=am&gl=ET&ceid=ET:am", amharicQuery)
+
+	feed, err := fp.ParseURL(feedURL)
+	if err != nil || len(feed.Items) == 0 {
+		log.Println("Amharic feed failed or empty, trying English soccer news:", err)
 		feed, err = fp.ParseURL("https://news.google.com/rss/search?q=soccer&hl=en-US&gl=US&ceid=US:en")
 		if err != nil {
 			log.Println("English feed also failed:", err)
@@ -159,9 +219,8 @@ func runScraper() {
 
 func scrapeAndStore(item *gofeed.Item) {
 	var existingID int
-	err := db.QueryRow(context.Background(), "SELECT id FROM news WHERE publisher_url = $1", item.Link).Scan(&existingID)
+	err := pool.QueryRow(context.Background(), "SELECT id FROM news WHERE publisher_url = $1", item.Link).Scan(&existingID)
 	if err == nil {
-		// Already exists
 		return
 	}
 
@@ -198,7 +257,7 @@ func scrapeAndStore(item *gofeed.Item) {
 		content = strings.TrimSpace(item.Description)
 	}
 
-	_, err = db.Exec(context.Background(),
+	_, err = pool.Exec(context.Background(),
 		"INSERT INTO news (title, content, image_url, publisher_url, created_at) VALUES ($1, $2, $3, $4, $5)",
 		item.Title, content, imageURL, item.Link, time.Now())
 	if err != nil {
