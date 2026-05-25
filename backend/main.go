@@ -64,46 +64,51 @@ func main() {
 
 		log.Printf("Connecting to database at %s", maskPassword(dbURL))
 
-		for i := 0; i < 10; i++ {
-			pool, err = pgxpool.NewWithConfig(context.Background(), config)
-			if err == nil {
-				err = pool.Ping(context.Background())
+		// Connect in the background to allow the server to start and pass health checks
+		go func() {
+			var err error
+			for i := 0; i < 30; i++ {
+				p, err := pgxpool.NewWithConfig(context.Background(), config)
 				if err == nil {
-					break
+					err = p.Ping(context.Background())
+					if err == nil {
+						pool = p
+						log.Println("Successfully connected to the database")
+						break
+					}
 				}
+				log.Printf("Failed to connect to database (attempt %d): %v", i+1, err)
+				if p != nil {
+					p.Close()
+				}
+				time.Sleep(10 * time.Second)
 			}
-			log.Printf("Failed to connect to database (attempt %d): %v", i+1, err)
-			if pool != nil {
-				pool.Close()
+
+			if pool == nil {
+				log.Printf("Could not connect to database after many retries")
+				return
 			}
-			time.Sleep(5 * time.Second)
-		}
 
-		if err != nil {
-			log.Fatal("Could not connect to database after retries:", err)
-		}
-		defer pool.Close()
+			// Auto-migrate: Create table
+			_, err = pool.Exec(context.Background(), `
+				CREATE TABLE IF NOT EXISTS news (
+					id SERIAL PRIMARY KEY,
+					title TEXT NOT NULL,
+					content TEXT,
+					image_url TEXT,
+					publisher_url TEXT UNIQUE,
+					created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+				);
+			`)
+			if err != nil {
+				log.Printf("Failed to create table: %v", err)
+				return
+			}
+			log.Println("Database schema initialized.")
 
-		// Auto-migrate: Create table
-		_, err = pool.Exec(context.Background(), `
-			CREATE TABLE IF NOT EXISTS news (
-				id SERIAL PRIMARY KEY,
-				title TEXT NOT NULL,
-				content TEXT,
-				image_url TEXT,
-				publisher_url TEXT UNIQUE,
-				created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-			);
-		`)
-		if err != nil {
-			log.Fatal("Failed to create table:", err)
-		}
-		log.Println("Database schema initialized.")
-	}
-
-	// Start background scraper
-	if pool != nil {
-		go startScheduledScraper()
+			// Start background scraper
+			startScheduledScraper()
+		}()
 	}
 
 	http.HandleFunc("/api/news", getNews)
@@ -111,7 +116,7 @@ func main() {
 
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "8080"
+		port = "10000" // Use 10000 for Render
 	}
 	fmt.Printf("Server starting on port %s...\n", port)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
@@ -135,13 +140,12 @@ func healthCheck(w http.ResponseWriter, r *http.Request) {
 	status := "OK"
 	dbStatus := "Connected"
 	if pool == nil {
-		dbStatus = "Not Configured"
+		dbStatus = "Connecting or Not Configured"
 	} else if err := pool.Ping(context.Background()); err != nil {
 		dbStatus = "Disconnected: " + err.Error()
-		status = "Error"
-		w.WriteHeader(http.StatusInternalServerError)
 	}
 
+	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
 		"status":   status,
 		"database": dbStatus,
@@ -218,6 +222,10 @@ func runScraper() {
 }
 
 func scrapeAndStore(item *gofeed.Item) {
+	if pool == nil {
+		return
+	}
+
 	var existingID int
 	err := pool.QueryRow(context.Background(), "SELECT id FROM news WHERE publisher_url = $1", item.Link).Scan(&existingID)
 	if err == nil {
