@@ -29,58 +29,59 @@ type News struct {
 var pool *pgxpool.Pool
 
 func main() {
-	// Initialize DB connection with retries
-	dbURL := os.Getenv("DATABASE_URL")
+	dbURL := strings.TrimSpace(os.Getenv("DATABASE_URL"))
 	if dbURL == "" {
 		log.Println("DATABASE_URL is not set, skipping DB connection for now")
 	} else {
-		// Robustly ensure sslmode=require for Render Postgres
-		if !strings.Contains(dbURL, "sslmode=") {
-			if strings.Contains(dbURL, "?") {
-				dbURL += "&sslmode=require"
-			} else {
-				dbURL += "?sslmode=require"
-			}
-		} else {
-			dbURL = strings.Replace(dbURL, "sslmode=disable", "sslmode=require", 1)
-		}
-
-		config, err := pgxpool.ParseConfig(dbURL)
-		if err != nil {
-			log.Fatalf("Unable to parse DATABASE_URL: %v", err)
-		}
-
-		// Explicitly configure TLS to be more resilient on Render
-		if config.ConnConfig.TLSConfig == nil {
-			config.ConnConfig.TLSConfig = &tls.Config{}
-		}
-		config.ConnConfig.TLSConfig.InsecureSkipVerify = true
-
-		// Set connection pool settings for stability
-		config.MaxConns = 10
-		config.MinConns = 2
-		config.MaxConnLifetime = 1 * time.Hour
-		config.MaxConnIdleTime = 30 * time.Minute
-
-		log.Printf("Connecting to database at %s", maskPassword(dbURL))
-
 		// Connect in the background to allow the server to start and pass health checks
 		go func() {
-			var err error
+			var lastErr error
 			for i := 0; i < 30; i++ {
-				p, err := pgxpool.NewWithConfig(context.Background(), config)
+				currURL := dbURL
+
+				// Ensure sslmode is set correctly based on attempt number and URL type
+				u, err := url.Parse(currURL)
 				if err == nil {
-					err = p.Ping(context.Background())
-					if err == nil {
-						pool = p
-						log.Println("Successfully connected to the database")
-						break
+					q := u.Query()
+					if i >= 10 && strings.Contains(u.Host, ".render.com") {
+						// After 10 failed attempts, try internal host and disable SSL
+						hostParts := strings.Split(u.Host, ".")
+						if len(hostParts) > 1 {
+							u.Host = hostParts[0]
+							q.Set("sslmode", "disable")
+						}
+					} else if q.Get("sslmode") == "" || q.Get("sslmode") == "disable" {
+						// Default to require for Render Postgres external connections
+						q.Set("sslmode", "require")
 					}
+					u.RawQuery = q.Encode()
+					currURL = u.String()
 				}
-				log.Printf("Failed to connect to database (attempt %d): %v", i+1, err)
-				if p != nil {
-					p.Close()
+
+				config, err := pgxpool.ParseConfig(currURL)
+				if err == nil {
+					if config.ConnConfig.TLSConfig == nil {
+						config.ConnConfig.TLSConfig = &tls.Config{}
+					}
+					config.ConnConfig.TLSConfig.InsecureSkipVerify = true
+					config.ConnConfig.TLSConfig.ServerName = config.ConnConfig.Host
+
+					p, err := pgxpool.NewWithConfig(context.Background(), config)
+					if err == nil {
+						err = p.Ping(context.Background())
+						if err == nil {
+							pool = p
+							log.Printf("Successfully connected to the database using %s", maskPassword(currURL))
+							break
+						}
+						p.Close()
+					}
+					lastErr = err
+				} else {
+					lastErr = err
 				}
+
+				log.Printf("Failed to connect to database (attempt %d) using %s: %v", i+1, maskPassword(currURL), lastErr)
 				time.Sleep(10 * time.Second)
 			}
 
@@ -90,7 +91,7 @@ func main() {
 			}
 
 			// Auto-migrate: Create table
-			_, err = pool.Exec(context.Background(), `
+			_, err := pool.Exec(context.Background(), `
 				CREATE TABLE IF NOT EXISTS news (
 					id SERIAL PRIMARY KEY,
 					title TEXT NOT NULL,
@@ -154,14 +155,17 @@ func healthCheck(w http.ResponseWriter, r *http.Request) {
 }
 
 func startScheduledScraper() {
+	log.Println("Starting background scraper scheduler...")
 	// Run immediately on start
-	runScraper()
+	go runScraper()
 
 	// Then run every hour
 	ticker := time.NewTicker(1 * time.Hour)
-	for range ticker.C {
-		runScraper()
-	}
+	go func() {
+		for range ticker.C {
+			runScraper()
+		}
+	}()
 }
 
 func getNews(w http.ResponseWriter, r *http.Request) {
@@ -197,7 +201,7 @@ func getNews(w http.ResponseWriter, r *http.Request) {
 }
 
 func runScraper() {
-	log.Println("Starting scraper...")
+	log.Println("Scraping cycle started...")
 	fp := gofeed.NewParser()
 
 	// Soccer news in Amharic (እግር ኳስ)
