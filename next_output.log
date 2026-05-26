@@ -1,0 +1,21 @@
+
+> fotmob-amharic@1.0.0 dev
+> next dev
+
+ ⚠ Port 3000 is in use, trying 3001 instead.
+  ▲ Next.js 14.2.35
+  - Local:        http://localhost:3001
+
+ ✓ Starting...
+ ✓ Ready in 1409ms
+ ○ Compiling /news ...
+ ✓ Compiled /news in 7.2s (562 modules)
+react-i18next:: You will need to pass in an i18next instance by using initReactI18next
+ GET /news 200 in 7845ms
+ ✓ Compiled in 676ms (289 modules)
+ GET /news 200 in 45ms
+ ○ Compiling /news/[id] ...
+ ✓ Compiled /news/[id] in 559ms (558 modules)
+react-i18next:: You will need to pass in an i18next instance by using initReactI18next
+ GET /news 200 in 154ms
+[?25h

@@ -10,6 +10,7 @@
     "lint": "next lint"
   },
   "dependencies": {
+    "@heroicons/react": "^2.2.0",
     "autoprefixer": "^10.4.17",
     "clsx": "^2.1.1",
     "i18next": "^23.10.0",
