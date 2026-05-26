@@ -134,6 +134,7 @@ func main() {
 	}
 
 	http.HandleFunc("/api/news", getNews)
+	http.HandleFunc("/api/news/", getNewsItem) // handles /api/news/{id}
 	http.HandleFunc("/api/health", healthCheck)
 
 	port := os.Getenv("PORT")
@@ -250,6 +251,45 @@ func getNews(w http.ResponseWriter, r *http.Request) {
 		newsList = append(newsList, n)
 	}
 	json.NewEncoder(w).Encode(newsList)
+}
+
+// getNewsItem handles GET /api/news/{id}  – returns a single news record.
+func getNewsItem(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	// Extract the numeric ID from the path: /api/news/42
+	idStr := strings.TrimPrefix(r.URL.Path, "/api/news/")
+	idStr = strings.TrimSuffix(idStr, "/")
+	if idStr == "" {
+		http.Error(w, `{"error":"missing id"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Validate: digits only
+	for _, ch := range idStr {
+		if ch < '0' || ch > '9' {
+			http.Error(w, `{"error":"invalid id"}`, http.StatusBadRequest)
+			return
+		}
+	}
+
+	if pool == nil {
+		http.Error(w, `{"error":"database not ready"}`, http.StatusServiceUnavailable)
+		return
+	}
+
+	var n News
+	err := pool.QueryRow(context.Background(),
+		`SELECT id, title, COALESCE(content,''), COALESCE(image_url,''), publisher_url, created_at
+		   FROM news WHERE id = $1`, idStr).
+		Scan(&n.ID, &n.Title, &n.Content, &n.ImageURL, &n.PublisherURL, &n.CreatedAt)
+	if err != nil {
+		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+		return
+	}
+
+	json.NewEncoder(w).Encode(n)
 }
 
 // ─── Scheduler ────────────────────────────────────────────────────────────────
