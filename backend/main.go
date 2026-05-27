@@ -13,9 +13,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gocolly/colly/v2"
-	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/mmcdole/gofeed"
+"github.com/PuerkitoBio/goquery"
+"github.com/gocolly/colly/v2"
+"github.com/jackc/pgx/v5/pgxpool"
+"github.com/mmcdole/gofeed"
 )
 
 // ─── Data Types ──────────────────────────────────────────────────────────────
