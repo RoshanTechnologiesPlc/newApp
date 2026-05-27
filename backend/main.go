@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"io"
 
 	"github.com/gocolly/colly/v2"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -325,11 +326,12 @@ func resolveByGoogleHTML(rawURL string) string {
 	}
 	defer resp.Body.Close()
 
-	var builder strings.Builder
-	_, err = builder.ReadFrom(resp.Body)
-	if err != nil {
-		return ""
-	}
+	bodyBytes, err := io.ReadAll(resp.Body)
+if err != nil {
+	return ""
+}
+
+body := html.UnescapeString(string(bodyBytes))
 
 	body := html.UnescapeString(builder.String())
 	body = strings.ReplaceAll(body, `\/`, `/`)
