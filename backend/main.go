@@ -37,7 +37,6 @@ var pool *pgxpool.Pool
 
 const chromeUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
-// Shared HTTP client that follows redirects.
 var httpClient = &http.Client{
 	Timeout: 20 * time.Second,
 	CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -53,7 +52,6 @@ var httpClient = &http.Client{
 	},
 }
 
-// Strip HTML tags and normalize whitespace.
 var htmlTagRe = regexp.MustCompile(`<[^>]+>`)
 var multiSpaceRe = regexp.MustCompile(`\s{2,}`)
 
@@ -188,17 +186,21 @@ func resolveGoogleURL(rawURL string) string {
 		return rawURL
 	}
 
-	// First try decoding the CBMi... ID directly from the RSS URL.
 	resolved := decodeGoogleBase64URL(rawURL)
-	if resolved != "" && !strings.Contains(resolved, "news.google.com") {
+	if isRealPublisherURL(resolved) {
 		log.Printf("Resolved Google News URL by base64: %s → %s", rawURL, resolved)
 		return resolved
 	}
 
-	// Then try Google's batchexecute decoder.
-	resolved = decodeGoogleNewsURL(rawURL)
-	if resolved != "" && !strings.Contains(resolved, "news.google.com") {
-		log.Printf("Resolved Google News URL by batchexecute: %s → %s", rawURL, resolved)
+	resolved = resolveByHTTPRedirect(rawURL)
+	if isRealPublisherURL(resolved) {
+		log.Printf("Resolved Google News URL by redirect: %s → %s", rawURL, resolved)
+		return resolved
+	}
+
+	resolved = resolveByGoogleHTML(rawURL)
+	if isRealPublisherURL(resolved) {
+		log.Printf("Resolved Google News URL by HTML: %s → %s", rawURL, resolved)
 		return resolved
 	}
 
@@ -206,35 +208,31 @@ func resolveGoogleURL(rawURL string) string {
 	return rawURL
 }
 
-func resolveByHTTPRedirect(rawURL string) string {
-	articleURL := strings.Replace(rawURL, "/rss/articles/", "/articles/", 1)
+func isRealPublisherURL(value string) bool {
+	value = strings.TrimSpace(value)
 
-	req, err := http.NewRequest("GET", articleURL, nil)
-	if err != nil {
-		return ""
+	if value == "" {
+		return false
 	}
 
-	req.Header.Set("User-Agent", chromeUA)
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		log.Printf("resolveByHTTPRedirect failed: %v", err)
-		return ""
-	}
-	defer resp.Body.Close()
-
-	finalURL := resp.Request.URL.String()
-
-	if finalURL != "" &&
-		!strings.Contains(finalURL, "news.google.com") &&
-		!strings.Contains(finalURL, "google.com") &&
-		!strings.Contains(finalURL, "gstatic.com") {
-		return finalURL
+	if !strings.HasPrefix(value, "http://") && !strings.HasPrefix(value, "https://") {
+		return false
 	}
 
-	return ""
+	blockedHosts := []string{
+		"news.google.com",
+		"google.com",
+		"gstatic.com",
+		"googleusercontent.com",
+	}
+
+	for _, blocked := range blockedHosts {
+		if strings.Contains(value, blocked) {
+			return false
+		}
+	}
+
+	return true
 }
 
 func decodeGoogleBase64URL(rawURL string) string {
@@ -261,16 +259,18 @@ func decodeGoogleBase64URL(rawURL string) string {
 		}
 	}
 
-	text := string(decoded)
+	text := html.UnescapeString(string(decoded))
+	text = strings.ReplaceAll(text, `\/`, `/`)
+	text = strings.ReplaceAll(text, `\u003d`, `=`)
+	text = strings.ReplaceAll(text, `\u0026`, `&`)
 
 	urlRe := regexp.MustCompile(`https?://[^\x00-\x20"'\\<>]+`)
 	matches := urlRe.FindAllString(text, -1)
 
 	for _, candidate := range matches {
 		candidate = strings.TrimSpace(candidate)
-		if candidate != "" &&
-			!strings.Contains(candidate, "google.com") &&
-			!strings.Contains(candidate, "gstatic.com") {
+
+		if isRealPublisherURL(candidate) {
 			return candidate
 		}
 	}
@@ -278,6 +278,77 @@ func decodeGoogleBase64URL(rawURL string) string {
 	return ""
 }
 
+func resolveByHTTPRedirect(rawURL string) string {
+	articleURL := strings.Replace(rawURL, "/rss/articles/", "/articles/", 1)
+
+	req, err := http.NewRequest("GET", articleURL, nil)
+	if err != nil {
+		return ""
+	}
+
+	req.Header.Set("User-Agent", chromeUA)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		log.Printf("resolveByHTTPRedirect failed: %v", err)
+		return ""
+	}
+	defer resp.Body.Close()
+
+	finalURL := resp.Request.URL.String()
+
+	if isRealPublisherURL(finalURL) {
+		return finalURL
+	}
+
+	return ""
+}
+
+func resolveByGoogleHTML(rawURL string) string {
+	articleURL := strings.Replace(rawURL, "/rss/articles/", "/articles/", 1)
+
+	req, err := http.NewRequest("GET", articleURL, nil)
+	if err != nil {
+		return ""
+	}
+
+	req.Header.Set("User-Agent", chromeUA)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		log.Printf("resolveByGoogleHTML failed: %v", err)
+		return ""
+	}
+	defer resp.Body.Close()
+
+	var builder strings.Builder
+	_, err = builder.ReadFrom(resp.Body)
+	if err != nil {
+		return ""
+	}
+
+	body := html.UnescapeString(builder.String())
+	body = strings.ReplaceAll(body, `\/`, `/`)
+	body = strings.ReplaceAll(body, `\u003d`, `=`)
+	body = strings.ReplaceAll(body, `\u0026`, `&`)
+
+	urlRe := regexp.MustCompile(`https?://[^\s"'<>\\]+`)
+	matches := urlRe.FindAllString(body, -1)
+
+	for _, candidate := range matches {
+		candidate = strings.TrimSpace(candidate)
+
+		if isRealPublisherURL(candidate) {
+			return candidate
+		}
+	}
+
+	return ""
+}
 
 // ─── HTTP Handlers ───────────────────────────────────────────────────────────
 
