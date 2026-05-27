@@ -162,12 +162,16 @@ func maskPassword(dsn string) string {
 }
 
 // stripHTML removes all HTML tags and normalises whitespace.
+
 func stripHTML(s string) string {
+	s = strings.ReplaceAll(s, "&nbsp;", " ")
+	s = strings.ReplaceAll(s, "&amp;", "&")
+	s = strings.ReplaceAll(s, "&quot;", `"`)
+	s = strings.ReplaceAll(s, "&#39;", "'")
 	s = htmlTagRe.ReplaceAllString(s, " ")
 	s = multiSpaceRe.ReplaceAllString(s, " ")
 	return strings.TrimSpace(s)
 }
-
 // resolveGoogleURL follows the Google News redirect chain and returns the real
 // article URL. Google RSS links look like:
 //
