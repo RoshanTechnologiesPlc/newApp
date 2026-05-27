@@ -183,31 +183,69 @@ func stripHTML(s string) string {
 
 // ─── Google News URL Resolver ────────────────────────────────────────────────
 
-func resolveGoogleURL(rawURL string) string {
+// resolveGoogleURL tries 4 methods in order of reliability to turn a
+// news.google.com RSS link into the real publisher URL.
+// If all methods fail it returns the original Google URL — the caller
+// must NOT skip articles just because resolution failed; we still store
+// the article content from the RSS feed.
+func resolveGoogleURL(item *gofeed.Item) string {
+	rawURL := item.Link
+
 	if !strings.Contains(rawURL, "news.google.com") {
 		return rawURL
 	}
 
-	resolved := decodeGoogleBase64URL(rawURL)
-	if isRealPublisherURL(resolved) {
-		log.Printf("Resolved Google News URL by base64: %s → %s", rawURL, resolved)
-		return resolved
+	// ── Method 1: extract href from RSS <description> HTML ────────────────
+	// Google News RSS puts the real article URL inside an <a href="..."> in
+	// the description field. This is the most reliable method – no HTTP needed.
+	if u := extractURLFromDescription(item.Description); isRealPublisherURL(u) {
+		log.Printf("Resolved via RSS description: %s", u)
+		return u
 	}
 
-	resolved = resolveByHTTPRedirect(rawURL)
-	if isRealPublisherURL(resolved) {
-		log.Printf("Resolved Google News URL by redirect: %s → %s", rawURL, resolved)
-		return resolved
+	// ── Method 2: check item.Links for any non-Google URL ─────────────────
+	for _, link := range item.Links {
+		if isRealPublisherURL(link) {
+			log.Printf("Resolved via item.Links: %s", link)
+			return link
+		}
 	}
 
-	resolved = resolveByGoogleHTML(rawURL)
-	if isRealPublisherURL(resolved) {
-		log.Printf("Resolved Google News URL by HTML: %s → %s", rawURL, resolved)
-		return resolved
+	// ── Method 3: base64-decode the article ID and scan for https:// ──────
+	if u := decodeGoogleBase64URL(rawURL); isRealPublisherURL(u) {
+		log.Printf("Resolved via base64 decode: %s", u)
+		return u
 	}
 
-	log.Printf("Could not resolve Google News URL, keeping original: %s", rawURL)
+	// ── Method 4: HTTP fetch + body scan (last resort) ────────────────────
+	if u := resolveByHTTPFetch(rawURL); isRealPublisherURL(u) {
+		log.Printf("Resolved via HTTP fetch: %s", u)
+		return u
+	}
+
+	log.Printf("Could not resolve Google News URL, will store with RSS content: %s", rawURL)
 	return rawURL
+}
+
+// extractURLFromDescription parses the HTML in an RSS <description> field
+// and returns the first non-Google href it finds.
+// Google News descriptions look like:
+//
+//	<a href="https://bbc.com/sport/...">BBC Sport</a>
+func extractURLFromDescription(desc string) string {
+	if desc == "" {
+		return ""
+	}
+	// Unescape HTML entities like &amp; → &
+	desc = html.UnescapeString(desc)
+
+	hrefRe := regexp.MustCompile(`href=["'](https?://[^"']+)["']`)
+	for _, m := range hrefRe.FindAllStringSubmatch(desc, -1) {
+		if len(m) > 1 && isRealPublisherURL(m[1]) {
+			return m[1]
+		}
+	}
+	return ""
 }
 
 func isRealPublisherURL(value string) bool {
@@ -280,71 +318,59 @@ func decodeGoogleBase64URL(rawURL string) string {
 	return ""
 }
 
-func resolveByHTTPRedirect(rawURL string) string {
-	articleURL := strings.Replace(rawURL, "/rss/articles/", "/articles/", 1)
-
-	req, err := http.NewRequest("GET", articleURL, nil)
-	if err != nil {
-		return ""
+func resolveByHTTPFetch(rawURL string) string {
+	// Try both the /rss/articles/ and /articles/ variants
+	candidates := []string{
+		strings.Replace(rawURL, "/rss/articles/", "/articles/", 1),
+		rawURL,
 	}
 
-	req.Header.Set("User-Agent", chromeUA)
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	for _, articleURL := range candidates {
+		req, err := http.NewRequest("GET", articleURL, nil)
+		if err != nil {
+			continue
+		}
+		req.Header.Set("User-Agent", chromeUA)
+		req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+		req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+		req.Header.Set("Referer", "https://news.google.com/")
 
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		log.Printf("resolveByHTTPRedirect failed: %v", err)
-		return ""
-	}
-	defer resp.Body.Close()
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			log.Printf("resolveByHTTPFetch failed for %s: %v", articleURL, err)
+			continue
+		}
 
-	finalURL := resp.Request.URL.String()
+		// Check if we landed on a real publisher page via HTTP redirect
+		if finalURL := resp.Request.URL.String(); isRealPublisherURL(finalURL) {
+			resp.Body.Close()
+			return finalURL
+		}
 
-	if isRealPublisherURL(finalURL) {
-		return finalURL
-	}
+		// Read body and scan for real URLs embedded in HTML / JS
+		bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, 200*1024))
+		resp.Body.Close()
+		if err != nil {
+			continue
+		}
 
-	return ""
-}
+		body := html.UnescapeString(string(bodyBytes))
+		body = strings.ReplaceAll(body, `\/`, `/`)
 
-func resolveByGoogleHTML(rawURL string) string {
-	articleURL := strings.Replace(rawURL, "/rss/articles/", "/articles/", 1)
+		// Priority: href= links first (more reliable than JS values)
+		hrefRe := regexp.MustCompile(`href=["'](https?://[^"']+)["']`)
+		for _, m := range hrefRe.FindAllStringSubmatch(body, -1) {
+			if len(m) > 1 && isRealPublisherURL(m[1]) {
+				return m[1]
+			}
+		}
 
-	req, err := http.NewRequest("GET", articleURL, nil)
-	if err != nil {
-		return ""
-	}
-
-	req.Header.Set("User-Agent", chromeUA)
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		log.Printf("resolveByGoogleHTML failed: %v", err)
-		return ""
-	}
-	defer resp.Body.Close()
-
-	bodyBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return ""
-	}
-
-	body := html.UnescapeString(string(bodyBytes))
-	body = strings.ReplaceAll(body, `\/`, `/`)
-	body = strings.ReplaceAll(body, `\u003d`, `=`)
-	body = strings.ReplaceAll(body, `\u0026`, `&`)
-
-	urlRe := regexp.MustCompile(`https?://[^\s"'<>\\]+`)
-	matches := urlRe.FindAllString(body, -1)
-
-	for _, candidate := range matches {
-		candidate = strings.TrimSpace(candidate)
-
-		if isRealPublisherURL(candidate) {
-			return candidate
+		// Fallback: any https:// URL in the page
+		urlRe := regexp.MustCompile(`https?://[^\s"'<>\\]+`)
+		for _, candidate := range urlRe.FindAllString(body, -1) {
+			if isRealPublisherURL(strings.TrimRight(candidate, ".,;)")) {
+				return strings.TrimRight(candidate, ".,;)")
+			}
 		}
 	}
 
@@ -498,40 +524,29 @@ func scrapeAndStore(item *gofeed.Item) {
 		return
 	}
 
-	realURL := resolveGoogleURL(item.Link)
+	// Resolve the real publisher URL using all available methods
+	realURL := resolveGoogleURL(item)
 
-	if strings.Contains(realURL, "news.google.com") {
-		log.Printf("Skip unresolved Google News URL, not storing RSS wrapper: %s", item.Title)
-		return
-	}
-
-	var existingRealID int
-
+	// ── Deduplication ────────────────────────────────────────────────────
+	var existingID int
 	err := pool.QueryRow(context.Background(),
-		"SELECT id FROM news WHERE publisher_url = $1",
-		realURL).Scan(&existingRealID)
-
+		"SELECT id FROM news WHERE publisher_url = $1 OR publisher_url = $2",
+		realURL, item.Link).Scan(&existingID)
 	if err == nil {
-		log.Printf("Skip real URL already stored: %s", item.Title)
+		log.Printf("Skip (already stored): %s", item.Title)
 		return
 	}
 
-	var existingGoogleID int
-
-	err = pool.QueryRow(context.Background(),
-		"SELECT id FROM news WHERE publisher_url = $1",
-		item.Link).Scan(&existingGoogleID)
-
-	hasOldGoogleRow := err == nil
-
-	content, imageURL := scrapeArticlePage(realURL)
-
-	if len(strings.TrimSpace(content)) < 100 {
-		if item.Content != "" {
-			content = stripHTML(item.Content)
-		}
+	// ── Scrape the article page if we have a real publisher URL ──────────
+	var content, imageURL string
+	if isRealPublisherURL(realURL) {
+		content, imageURL = scrapeArticlePage(realURL)
 	}
 
+	// ── Fallbacks for content ────────────────────────────────────────────
+	if len(strings.TrimSpace(content)) < 100 && item.Content != "" {
+		content = stripHTML(item.Content)
+	}
 	if len(strings.TrimSpace(content)) < 100 {
 		content = stripHTML(item.Description)
 	}
@@ -539,43 +554,16 @@ func scrapeAndStore(item *gofeed.Item) {
 	title := stripHTML(item.Title)
 	content = strings.TrimSpace(content)
 
-	if hasOldGoogleRow {
-		_, err = pool.Exec(context.Background(),
-			`UPDATE news
-			    SET title = $1,
-			        content = $2,
-			        image_url = $3,
-			        publisher_url = $4,
-			        created_at = $5
-			  WHERE id = $6`,
-			title,
-			content,
-			imageURL,
-			realURL,
-			time.Now(),
-			existingGoogleID,
-		)
-
-		if err != nil {
-			log.Printf("DB update error for '%s': %v", item.Title, err)
-		} else {
-			log.Printf("Updated old Google News row to real publisher URL: %s", realURL)
-		}
-
-		return
-	}
+	// Use the best URL we have — real publisher URL if resolved, otherwise
+	// the Google News URL. Either way we store the article.
+	storeURL := realURL
 
 	_, err = pool.Exec(context.Background(),
 		`INSERT INTO news (title, content, image_url, publisher_url, created_at)
 		 VALUES ($1, $2, $3, $4, $5)
 		 ON CONFLICT (publisher_url) DO NOTHING`,
-		title,
-		content,
-		imageURL,
-		realURL,
-		time.Now(),
+		title, content, imageURL, storeURL, time.Now(),
 	)
-
 	if err != nil {
 		log.Printf("DB insert error for '%s': %v", item.Title, err)
 		return
@@ -585,8 +573,7 @@ func scrapeAndStore(item *gofeed.Item) {
 	if len(preview) > 80 {
 		preview = preview[:80] + "…"
 	}
-
-	log.Printf("Stored (%d chars): %s | %s", len(content), title, preview)
+	log.Printf("Stored (%d chars) [%s]: %s | %s", len(content), storeURL, title, preview)
 }
 
 func scrapeArticlePage(articleURL string) (content, imageURL string) {
