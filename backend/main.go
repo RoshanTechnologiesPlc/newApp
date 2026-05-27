@@ -185,82 +185,165 @@ func resolveGoogleURL(rawURL string) string {
 		return rawURL
 	}
 
+	resolved := decodeGoogleNewsURL(rawURL)
+	if resolved != "" && !strings.Contains(resolved, "news.google.com") {
+		log.Printf("Resolved Google News URL: %s → %s", rawURL, resolved)
+		return resolved
+	}
+
+	log.Printf("Could not resolve Google News URL, keeping original: %s", rawURL)
+	return rawURL
+}
+
+func decodeGoogleNewsURL(rawURL string) string {
 	req, err := http.NewRequest("GET", rawURL, nil)
 	if err != nil {
-		return rawURL
+		return ""
 	}
+
 	req.Header.Set("User-Agent", chromeUA)
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		log.Printf("resolveGoogleURL: request failed %s: %v", rawURL, err)
-		return rawURL
+		log.Printf("decodeGoogleNewsURL GET failed: %v", err)
+		return ""
 	}
 	defer resp.Body.Close()
 
-	finalURL := resp.Request.URL.String()
-	if finalURL != "" && !strings.Contains(finalURL, "news.google.com") {
-		log.Printf("Resolved by redirect: %s → %s", rawURL, finalURL)
-		return finalURL
-	}
-
-	doc, err := goquery.NewDocumentFromReader(resp.Body)
+	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
-		log.Printf("resolveGoogleURL: parse failed %s: %v", rawURL, err)
-		return rawURL
+		return ""
 	}
 
-	if canonical, exists := doc.Find(`link[rel="canonical"]`).Attr("href"); exists {
-		canonical = strings.TrimSpace(canonical)
-		if canonical != "" && !strings.Contains(canonical, "news.google.com") {
-			log.Printf("Resolved by canonical: %s → %s", rawURL, canonical)
-			return canonical
+	body := string(bodyBytes)
+
+	signature := extractGoogleAttr(body, `data-n-a-sg`)
+	timestamp := extractGoogleAttr(body, `data-n-a-ts`)
+
+	if signature == "" || timestamp == "" {
+		log.Printf("decodeGoogleNewsURL missing signature/timestamp for %s", rawURL)
+		return ""
+	}
+
+	requestPayload := []any{
+		"garturlreq",
+		[]any{
+			[]any{
+				"en-US",
+				"US",
+				[]any{"FINANCE_TOP_INDICES", "WEB_TEST_1_0_0"},
+				nil,
+				nil,
+				1,
+				1,
+				"US:en",
+				nil,
+				180,
+				nil,
+				nil,
+				nil,
+				nil,
+				nil,
+				0,
+				nil,
+				nil,
+				[]any{1608992183, 723341000},
+			},
+			"en-US",
+			"US",
+			1,
+			[]any{2, 3, 4, 8},
+			1,
+			0,
+			"655000234",
+			0,
+			0,
+			nil,
+			0,
+		},
+		signature,
+		timestamp,
+	}
+
+	requestPayloadJSON, err := json.Marshal(requestPayload)
+	if err != nil {
+		return ""
+	}
+
+	outerPayload := []any{
+		[]any{
+			[]any{
+				"Fbv4je",
+				string(requestPayloadJSON),
+				nil,
+				"generic",
+			},
+		},
+	}
+
+	outerPayloadJSON, err := json.Marshal(outerPayload)
+	if err != nil {
+		return ""
+	}
+
+	form := url.Values{}
+	form.Set("f.req", string(outerPayloadJSON))
+
+	batchReq, err := http.NewRequest(
+		"POST",
+		"https://news.google.com/_/DotsSplashUi/data/batchexecute?rpcids=Fbv4je",
+		bytes.NewBufferString(form.Encode()),
+	)
+	if err != nil {
+		return ""
+	}
+
+	batchReq.Header.Set("User-Agent", chromeUA)
+	batchReq.Header.Set("Content-Type", "application/x-www-form-urlencoded;charset=UTF-8")
+	batchReq.Header.Set("Accept", "*/*")
+	batchReq.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	batchReq.Header.Set("Origin", "https://news.google.com")
+	batchReq.Header.Set("Referer", rawURL)
+
+	batchResp, err := httpClient.Do(batchReq)
+	if err != nil {
+		log.Printf("decodeGoogleNewsURL batch request failed: %v", err)
+		return ""
+	}
+	defer batchResp.Body.Close()
+
+	batchBodyBytes, err := io.ReadAll(batchResp.Body)
+	if err != nil {
+		return ""
+	}
+
+	batchBody := string(batchBodyBytes)
+	batchBody = strings.ReplaceAll(batchBody, `\/`, `/`)
+	batchBody = strings.ReplaceAll(batchBody, `\u003d`, `=`)
+	batchBody = strings.ReplaceAll(batchBody, `\u0026`, `&`)
+
+	urlRe := regexp.MustCompile(`https?://[^"\\]+`)
+	matches := urlRe.FindAllString(batchBody, -1)
+
+	for _, candidate := range matches {
+		if !strings.Contains(candidate, "google.com") &&
+			!strings.Contains(candidate, "gstatic.com") {
+			return candidate
 		}
 	}
 
-	if ogURL, exists := doc.Find(`meta[property="og:url"]`).Attr("content"); exists {
-		ogURL = strings.TrimSpace(ogURL)
-		if ogURL != "" && !strings.Contains(ogURL, "news.google.com") {
-			log.Printf("Resolved by og:url: %s → %s", rawURL, ogURL)
-			return ogURL
-		}
+	return ""
+}
+
+func extractGoogleAttr(body string, attr string) string {
+	re := regexp.MustCompile(attr + `="([^"]+)"`)
+	match := re.FindStringSubmatch(body)
+	if len(match) < 2 {
+		return ""
 	}
-
-	doc.Find("a[href]").EachWithBreak(func(_ int, s *goquery.Selection) bool {
-		href, exists := s.Attr("href")
-		if !exists {
-			return true
-		}
-
-		href = strings.TrimSpace(href)
-
-		if strings.HasPrefix(href, "./articles/") {
-			return true
-		}
-
-		if strings.HasPrefix(href, "/articles/") {
-			return true
-		}
-
-		if strings.HasPrefix(href, "http") &&
-			!strings.Contains(href, "google.com") &&
-			!strings.Contains(href, "gstatic.com") {
-			finalURL = href
-			return false
-		}
-
-		return true
-	})
-
-	if finalURL != "" && !strings.Contains(finalURL, "news.google.com") {
-		log.Printf("Resolved by page link: %s → %s", rawURL, finalURL)
-		return finalURL
-	}
-
-	log.Printf("Could not resolve Google News URL, keeping original: %s", rawURL)
-	return rawURL
+	return html.UnescapeString(match[1])
 }
 // ─── HTTP Handlers ────────────────────────────────────────────────────────────
 
@@ -402,45 +485,77 @@ func scrapeAndStore(item *gofeed.Item) {
 		return
 	}
 
-	// ── 1. Resolve the real article URL from the Google redirect ──────────
 	realURL := resolveGoogleURL(item.Link)
 
-	// ── 2. Deduplication – check both the Google URL and the resolved URL ──
-	var existingID int
+	var existingRealID int
 	err := pool.QueryRow(context.Background(),
-		"SELECT id FROM news WHERE publisher_url = $1 OR publisher_url = $2",
-		item.Link, realURL).Scan(&existingID)
-	if err == nil {
-		log.Printf("Skip (already stored): %s", item.Title)
+		"SELECT id FROM news WHERE publisher_url = $1",
+		realURL).Scan(&existingRealID)
+
+	if err == nil && !strings.Contains(realURL, "news.google.com") {
+		log.Printf("Skip real URL already stored: %s", item.Title)
 		return
 	}
 
-	// ── 3. Scrape content and image from the real article page ────────────
+	var existingGoogleID int
+	err = pool.QueryRow(context.Background(),
+		"SELECT id FROM news WHERE publisher_url = $1",
+		item.Link).Scan(&existingGoogleID)
+
+	hasOldGoogleRow := err == nil
+
 	content, imageURL := scrapeArticlePage(realURL)
 
-	// ── 4. Fallbacks when live scraping returned nothing useful ───────────
 	if len(strings.TrimSpace(content)) < 100 {
-		// Try gofeed's parsed Content (from <content:encoded> in RSS)
 		if item.Content != "" {
 			content = stripHTML(item.Content)
 		}
 	}
+
 	if len(strings.TrimSpace(content)) < 100 {
-		// Last resort: use the RSS <description> snippet
 		content = stripHTML(item.Description)
 	}
 
-	// ── 5. Persist ────────────────────────────────────────────────────────
+	title := stripHTML(item.Title)
+	content = strings.TrimSpace(content)
+
+	if hasOldGoogleRow && !strings.Contains(realURL, "news.google.com") {
+		_, err = pool.Exec(context.Background(),
+			`UPDATE news
+			 SET title = $1,
+			     content = $2,
+			     image_url = $3,
+			     publisher_url = $4,
+			     created_at = $5
+			 WHERE id = $6`,
+			title,
+			content,
+			imageURL,
+			realURL,
+			time.Now(),
+			existingGoogleID,
+		)
+
+		if err != nil {
+			log.Printf("DB update error for '%s': %v", item.Title, err)
+		} else {
+			log.Printf("Updated old Google News row to real publisher URL: %s", realURL)
+		}
+
+		return
+	}
+
 	_, err = pool.Exec(context.Background(),
 		`INSERT INTO news (title, content, image_url, publisher_url, created_at)
 		 VALUES ($1, $2, $3, $4, $5)
 		 ON CONFLICT (publisher_url) DO NOTHING`,
-		item.Title,
-		strings.TrimSpace(content),
+		title,
+		content,
 		imageURL,
 		realURL,
 		time.Now(),
 	)
+
 	if err != nil {
 		log.Printf("DB insert error for '%s': %v", item.Title, err)
 	} else {
@@ -448,10 +563,9 @@ func scrapeAndStore(item *gofeed.Item) {
 		if len(preview) > 80 {
 			preview = preview[:80] + "…"
 		}
-		log.Printf("Stored (%d chars): %s | %s", len(content), item.Title, preview)
+		log.Printf("Stored (%d chars): %s | %s", len(content), title, preview)
 	}
 }
-
 // scrapeArticlePage visits the given URL and extracts the article body text
 // and the primary image (og:image / twitter:image / first <img> in article).
 //
