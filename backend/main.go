@@ -13,10 +13,10 @@ import (
 	"strings"
 	"time"
 	"bytes"
-"html"
-"io"
+    "html"
+    "io"
 
-"github.com/PuerkitoBio/goquery"
+
 "github.com/gocolly/colly/v2"
 "github.com/jackc/pgx/v5/pgxpool"
 "github.com/mmcdole/gofeed"
@@ -486,7 +486,10 @@ func scrapeAndStore(item *gofeed.Item) {
 	}
 
 	realURL := resolveGoogleURL(item.Link)
-
+if strings.Contains(realURL, "news.google.com") {
+	log.Printf("Skip unresolved Google News URL, not storing RSS wrapper: %s", item.Title)
+	return
+}
 	var existingRealID int
 	err := pool.QueryRow(context.Background(),
 		"SELECT id FROM news WHERE publisher_url = $1",
