@@ -176,7 +176,6 @@ func stripHTML(s string) string {
 // They redirect (usually via 301/302/303) to the publisher page.
 // If resolution fails for any reason we fall back to the original link.
 func resolveGoogleURL(rawURL string) string {
-	// Only bother resolving if it actually looks like a Google redirect
 	if !strings.Contains(rawURL, "news.google.com") {
 		return rawURL
 	}
@@ -187,23 +186,77 @@ func resolveGoogleURL(rawURL string) string {
 	}
 	req.Header.Set("User-Agent", chromeUA)
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.5")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		log.Printf("resolveGoogleURL: failed to resolve %s: %v", rawURL, err)
+		log.Printf("resolveGoogleURL: request failed %s: %v", rawURL, err)
 		return rawURL
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
 
 	finalURL := resp.Request.URL.String()
-	if finalURL == "" || finalURL == rawURL {
+	if finalURL != "" && !strings.Contains(finalURL, "news.google.com") {
+		log.Printf("Resolved by redirect: %s → %s", rawURL, finalURL)
+		return finalURL
+	}
+
+	doc, err := goquery.NewDocumentFromReader(resp.Body)
+	if err != nil {
+		log.Printf("resolveGoogleURL: parse failed %s: %v", rawURL, err)
 		return rawURL
 	}
-	log.Printf("Resolved %s  →  %s", rawURL, finalURL)
-	return finalURL
-}
 
+	if canonical, exists := doc.Find(`link[rel="canonical"]`).Attr("href"); exists {
+		canonical = strings.TrimSpace(canonical)
+		if canonical != "" && !strings.Contains(canonical, "news.google.com") {
+			log.Printf("Resolved by canonical: %s → %s", rawURL, canonical)
+			return canonical
+		}
+	}
+
+	if ogURL, exists := doc.Find(`meta[property="og:url"]`).Attr("content"); exists {
+		ogURL = strings.TrimSpace(ogURL)
+		if ogURL != "" && !strings.Contains(ogURL, "news.google.com") {
+			log.Printf("Resolved by og:url: %s → %s", rawURL, ogURL)
+			return ogURL
+		}
+	}
+
+	doc.Find("a[href]").EachWithBreak(func(_ int, s *goquery.Selection) bool {
+		href, exists := s.Attr("href")
+		if !exists {
+			return true
+		}
+
+		href = strings.TrimSpace(href)
+
+		if strings.HasPrefix(href, "./articles/") {
+			return true
+		}
+
+		if strings.HasPrefix(href, "/articles/") {
+			return true
+		}
+
+		if strings.HasPrefix(href, "http") &&
+			!strings.Contains(href, "google.com") &&
+			!strings.Contains(href, "gstatic.com") {
+			finalURL = href
+			return false
+		}
+
+		return true
+	})
+
+	if finalURL != "" && !strings.Contains(finalURL, "news.google.com") {
+		log.Printf("Resolved by page link: %s → %s", rawURL, finalURL)
+		return finalURL
+	}
+
+	log.Printf("Could not resolve Google News URL, keeping original: %s", rawURL)
+	return rawURL
+}
 // ─── HTTP Handlers ────────────────────────────────────────────────────────────
 
 func healthCheck(w http.ResponseWriter, r *http.Request) {
