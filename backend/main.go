@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"html"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -14,7 +15,6 @@ import (
 	"regexp"
 	"strings"
 	"time"
-	"io"
 
 	"github.com/gocolly/colly/v2"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -44,6 +44,7 @@ var httpClient = &http.Client{
 		if len(via) >= 15 {
 			return fmt.Errorf("stopped after 15 redirects")
 		}
+
 		req.Header.Set("User-Agent", chromeUA)
 		return nil
 	},
@@ -327,13 +328,11 @@ func resolveByGoogleHTML(rawURL string) string {
 	defer resp.Body.Close()
 
 	bodyBytes, err := io.ReadAll(resp.Body)
-if err != nil {
-	return ""
-}
+	if err != nil {
+		return ""
+	}
 
-body := html.UnescapeString(string(bodyBytes))
-
-	body := html.UnescapeString(builder.String())
+	body := html.UnescapeString(string(bodyBytes))
 	body = strings.ReplaceAll(body, `\/`, `/`)
 	body = strings.ReplaceAll(body, `\u003d`, `=`)
 	body = strings.ReplaceAll(body, `\u0026`, `&`)
