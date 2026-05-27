@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"html"
-	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -205,6 +204,37 @@ func resolveGoogleURL(rawURL string) string {
 
 	log.Printf("Could not resolve Google News URL, keeping original: %s", rawURL)
 	return rawURL
+}
+
+func resolveByHTTPRedirect(rawURL string) string {
+	articleURL := strings.Replace(rawURL, "/rss/articles/", "/articles/", 1)
+
+	req, err := http.NewRequest("GET", articleURL, nil)
+	if err != nil {
+		return ""
+	}
+
+	req.Header.Set("User-Agent", chromeUA)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		log.Printf("resolveByHTTPRedirect failed: %v", err)
+		return ""
+	}
+	defer resp.Body.Close()
+
+	finalURL := resp.Request.URL.String()
+
+	if finalURL != "" &&
+		!strings.Contains(finalURL, "news.google.com") &&
+		!strings.Contains(finalURL, "google.com") &&
+		!strings.Contains(finalURL, "gstatic.com") {
+		return finalURL
+	}
+
+	return ""
 }
 
 func decodeGoogleBase64URL(rawURL string) string {
