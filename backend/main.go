@@ -1,10 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"html"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -12,14 +16,10 @@ import (
 	"regexp"
 	"strings"
 	"time"
-	"bytes"
-    "html"
-    "io"
 
-
-"github.com/gocolly/colly/v2"
-"github.com/jackc/pgx/v5/pgxpool"
-"github.com/mmcdole/gofeed"
+	"github.com/gocolly/colly/v2"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/mmcdole/gofeed"
 )
 
 // ─── Data Types ──────────────────────────────────────────────────────────────
@@ -37,26 +37,25 @@ type News struct {
 
 var pool *pgxpool.Pool
 
-// Shared HTTP client that follows redirects – used for URL resolution
+const chromeUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
+// Shared HTTP client that follows redirects.
 var httpClient = &http.Client{
-	Timeout: 15 * time.Second,
+	Timeout: 20 * time.Second,
 	CheckRedirect: func(req *http.Request, via []*http.Request) error {
 		if len(via) >= 15 {
 			return fmt.Errorf("stopped after 15 redirects")
 		}
-		// Forward User-Agent on every hop
 		req.Header.Set("User-Agent", chromeUA)
 		return nil
 	},
 	Transport: &http.Transport{
 		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
-		ResponseHeaderTimeout: 10 * time.Second,
+		ResponseHeaderTimeout: 15 * time.Second,
 	},
 }
 
-const chromeUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-
-// Strip HTML tags (used for RSS description / content fallback)
+// Strip HTML tags and normalize whitespace.
 var htmlTagRe = regexp.MustCompile(`<[^>]+>`)
 var multiSpaceRe = regexp.MustCompile(`\s{2,}`)
 
@@ -64,16 +63,20 @@ var multiSpaceRe = regexp.MustCompile(`\s{2,}`)
 
 func main() {
 	dbURL := strings.TrimSpace(os.Getenv("DATABASE_URL"))
+
 	if dbURL == "" {
 		log.Println("DATABASE_URL is not set, skipping DB connection for now")
 	} else {
 		go func() {
 			var lastErr error
+
 			for i := 0; i < 30; i++ {
 				currURL := dbURL
+
 				u, err := url.Parse(currURL)
 				if err == nil {
 					q := u.Query()
+
 					if i >= 10 && strings.Contains(u.Host, ".render.com") {
 						hostParts := strings.Split(u.Host, ".")
 						if len(hostParts) > 1 {
@@ -83,6 +86,7 @@ func main() {
 					} else if q.Get("sslmode") == "" || q.Get("sslmode") == "disable" {
 						q.Set("sslmode", "require")
 					}
+
 					u.RawQuery = q.Encode()
 					currURL = u.String()
 				}
@@ -92,6 +96,7 @@ func main() {
 					if config.ConnConfig.TLSConfig == nil {
 						config.ConnConfig.TLSConfig = &tls.Config{}
 					}
+
 					config.ConnConfig.TLSConfig.InsecureSkipVerify = true
 					config.ConnConfig.TLSConfig.ServerName = config.ConnConfig.Host
 
@@ -102,8 +107,10 @@ func main() {
 							log.Printf("Connected to DB via %s", maskPassword(currURL))
 							break
 						}
+
 						p.Close()
 					}
+
 					lastErr = err
 				} else {
 					lastErr = err
@@ -120,52 +127,54 @@ func main() {
 
 			_, err := pool.Exec(context.Background(), `
 				CREATE TABLE IF NOT EXISTS news (
-					id           SERIAL PRIMARY KEY,
-					title        TEXT NOT NULL,
-					content      TEXT,
-					image_url    TEXT,
+					id            SERIAL PRIMARY KEY,
+					title         TEXT NOT NULL,
+					content       TEXT,
+					image_url     TEXT,
 					publisher_url TEXT UNIQUE,
-					created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+					created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 				);
 			`)
 			if err != nil {
 				log.Printf("Failed to create table: %v", err)
 				return
 			}
+
 			log.Println("DB schema ready.")
 			startScheduledScraper()
 		}()
 	}
 
 	http.HandleFunc("/api/news", getNews)
-	http.HandleFunc("/api/news/", getNewsItem) // handles /api/news/{id}
+	http.HandleFunc("/api/news/", getNewsItem)
 	http.HandleFunc("/api/health", healthCheck)
 
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "10000"
 	}
+
 	fmt.Printf("Server starting on port %s…\n", port)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 
 func maskPassword(dsn string) string {
 	u, err := url.Parse(dsn)
 	if err != nil {
 		return "invalid-url"
 	}
+
 	if u.User != nil {
 		_, hasPassword := u.User.Password()
 		if hasPassword {
 			u.User = url.UserPassword(u.User.Username(), "****")
 		}
 	}
+
 	return u.String()
 }
-
-// stripHTML removes all HTML tags and normalises whitespace.
 
 func stripHTML(s string) string {
 	s = html.UnescapeString(s)
@@ -173,21 +182,25 @@ func stripHTML(s string) string {
 	s = multiSpaceRe.ReplaceAllString(s, " ")
 	return strings.TrimSpace(s)
 }
-// resolveGoogleURL follows the Google News redirect chain and returns the real
-// article URL. Google RSS links look like:
-//
-//	https://news.google.com/rss/articles/CBMi...
-//
-// They redirect (usually via 301/302/303) to the publisher page.
-// If resolution fails for any reason we fall back to the original link.
+
+// ─── Google News URL Resolver ────────────────────────────────────────────────
+
 func resolveGoogleURL(rawURL string) string {
 	if !strings.Contains(rawURL, "news.google.com") {
 		return rawURL
 	}
 
-	resolved := decodeGoogleNewsURL(rawURL)
+	// First try decoding the CBMi... ID directly from the RSS URL.
+	resolved := decodeGoogleBase64URL(rawURL)
 	if resolved != "" && !strings.Contains(resolved, "news.google.com") {
-		log.Printf("Resolved Google News URL: %s → %s", rawURL, resolved)
+		log.Printf("Resolved Google News URL by base64: %s → %s", rawURL, resolved)
+		return resolved
+	}
+
+	// Then try Google's batchexecute decoder.
+	resolved = decodeGoogleNewsURL(rawURL)
+	if resolved != "" && !strings.Contains(resolved, "news.google.com") {
+		log.Printf("Resolved Google News URL by batchexecute: %s → %s", rawURL, resolved)
 		return resolved
 	}
 
@@ -195,8 +208,51 @@ func resolveGoogleURL(rawURL string) string {
 	return rawURL
 }
 
+func decodeGoogleBase64URL(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+
+	parts := strings.Split(u.Path, "/")
+	if len(parts) == 0 {
+		return ""
+	}
+
+	id := strings.TrimSpace(parts[len(parts)-1])
+	if id == "" {
+		return ""
+	}
+
+	decoded, err := base64.RawURLEncoding.DecodeString(id)
+	if err != nil {
+		decoded, err = base64.URLEncoding.DecodeString(id)
+		if err != nil {
+			return ""
+		}
+	}
+
+	text := string(decoded)
+
+	urlRe := regexp.MustCompile(`https?://[^\x00-\x20"'\\<>]+`)
+	matches := urlRe.FindAllString(text, -1)
+
+	for _, candidate := range matches {
+		candidate = strings.TrimSpace(candidate)
+		if candidate != "" &&
+			!strings.Contains(candidate, "google.com") &&
+			!strings.Contains(candidate, "gstatic.com") {
+			return candidate
+		}
+	}
+
+	return ""
+}
+
 func decodeGoogleNewsURL(rawURL string) string {
-	req, err := http.NewRequest("GET", rawURL, nil)
+	articleURL := strings.Replace(rawURL, "/rss/articles/", "/articles/", 1)
+
+	req, err := http.NewRequest("GET", articleURL, nil)
 	if err != nil {
 		return ""
 	}
@@ -223,7 +279,7 @@ func decodeGoogleNewsURL(rawURL string) string {
 	timestamp := extractGoogleAttr(body, `data-n-a-ts`)
 
 	if signature == "" || timestamp == "" {
-		log.Printf("decodeGoogleNewsURL missing signature/timestamp for %s", rawURL)
+		log.Printf("decodeGoogleNewsURL missing signature/timestamp for %s", articleURL)
 		return ""
 	}
 
@@ -305,7 +361,7 @@ func decodeGoogleNewsURL(rawURL string) string {
 	batchReq.Header.Set("Accept", "*/*")
 	batchReq.Header.Set("Accept-Language", "en-US,en;q=0.9")
 	batchReq.Header.Set("Origin", "https://news.google.com")
-	batchReq.Header.Set("Referer", rawURL)
+	batchReq.Header.Set("Referer", articleURL)
 
 	batchResp, err := httpClient.Do(batchReq)
 	if err != nil {
@@ -328,7 +384,9 @@ func decodeGoogleNewsURL(rawURL string) string {
 	matches := urlRe.FindAllString(batchBody, -1)
 
 	for _, candidate := range matches {
-		if !strings.Contains(candidate, "google.com") &&
+		candidate = strings.TrimSpace(candidate)
+		if candidate != "" &&
+			!strings.Contains(candidate, "google.com") &&
 			!strings.Contains(candidate, "gstatic.com") {
 			return candidate
 		}
@@ -338,22 +396,25 @@ func decodeGoogleNewsURL(rawURL string) string {
 }
 
 func extractGoogleAttr(body string, attr string) string {
-	re := regexp.MustCompile(attr + `="([^"]+)"`)
+	re := regexp.MustCompile(attr + `=["']([^"']+)["']`)
 	match := re.FindStringSubmatch(body)
 	if len(match) < 2 {
 		return ""
 	}
 	return html.UnescapeString(match[1])
 }
-// ─── HTTP Handlers ────────────────────────────────────────────────────────────
+
+// ─── HTTP Handlers ───────────────────────────────────────────────────────────
 
 func healthCheck(w http.ResponseWriter, r *http.Request) {
 	dbStatus := "Connected"
+
 	if pool == nil {
 		dbStatus = "Connecting or Not Configured"
 	} else if err := pool.Ping(context.Background()); err != nil {
 		dbStatus = "Disconnected: " + err.Error()
 	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
 		"status":   "OK",
@@ -373,7 +434,9 @@ func getNews(w http.ResponseWriter, r *http.Request) {
 
 	rows, err := pool.Query(context.Background(),
 		`SELECT id, title, COALESCE(content,''), COALESCE(image_url,''), publisher_url, created_at
-		   FROM news ORDER BY created_at DESC LIMIT 50`)
+		   FROM news
+		  ORDER BY created_at DESC
+		  LIMIT 50`)
 	if err != nil {
 		log.Println("Query error:", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -382,6 +445,7 @@ func getNews(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 
 	newsList := []News{}
+
 	for rows.Next() {
 		var n News
 		if err := rows.Scan(&n.ID, &n.Title, &n.Content, &n.ImageURL, &n.PublisherURL, &n.CreatedAt); err != nil {
@@ -389,25 +453,25 @@ func getNews(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+
 		newsList = append(newsList, n)
 	}
+
 	json.NewEncoder(w).Encode(newsList)
 }
 
-// getNewsItem handles GET /api/news/{id}  – returns a single news record.
 func getNewsItem(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
-	// Extract the numeric ID from the path: /api/news/42
 	idStr := strings.TrimPrefix(r.URL.Path, "/api/news/")
 	idStr = strings.TrimSuffix(idStr, "/")
+
 	if idStr == "" {
 		http.Error(w, `{"error":"missing id"}`, http.StatusBadRequest)
 		return
 	}
 
-	// Validate: digits only
 	for _, ch := range idStr {
 		if ch < '0' || ch > '9' {
 			http.Error(w, `{"error":"invalid id"}`, http.StatusBadRequest)
@@ -421,9 +485,11 @@ func getNewsItem(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var n News
+
 	err := pool.QueryRow(context.Background(),
 		`SELECT id, title, COALESCE(content,''), COALESCE(image_url,''), publisher_url, created_at
-		   FROM news WHERE id = $1`, idStr).
+		   FROM news
+		  WHERE id = $1`, idStr).
 		Scan(&n.ID, &n.Title, &n.Content, &n.ImageURL, &n.PublisherURL, &n.CreatedAt)
 	if err != nil {
 		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
@@ -433,13 +499,15 @@ func getNewsItem(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(n)
 }
 
-// ─── Scheduler ────────────────────────────────────────────────────────────────
+// ─── Scheduler ───────────────────────────────────────────────────────────────
 
 func startScheduledScraper() {
 	log.Println("Starting background scraper scheduler…")
+
 	go runScraper()
 
 	ticker := time.NewTicker(1 * time.Hour)
+
 	go func() {
 		for range ticker.C {
 			runScraper()
@@ -447,19 +515,20 @@ func startScheduledScraper() {
 	}()
 }
 
-// ─── Scraper ──────────────────────────────────────────────────────────────────
+// ─── Scraper ─────────────────────────────────────────────────────────────────
 
 func runScraper() {
 	log.Println("Scraping cycle started…")
+
 	fp := gofeed.NewParser()
 
-	// Try Amharic soccer news first, fall back to English
 	amharicQuery := url.QueryEscape("እግር ኳስ")
 	feedURL := fmt.Sprintf("https://news.google.com/rss/search?q=%s&hl=am&gl=ET&ceid=ET:am", amharicQuery)
 
 	feed, err := fp.ParseURL(feedURL)
 	if err != nil || len(feed.Items) == 0 {
 		log.Println("Amharic feed failed or empty, falling back to English soccer feed:", err)
+
 		feed, err = fp.ParseURL("https://news.google.com/rss/search?q=soccer&hl=en-US&gl=US&ceid=US:en")
 		if err != nil {
 			log.Println("English feed also failed:", err)
@@ -469,38 +538,39 @@ func runScraper() {
 
 	log.Printf("Feed returned %d items.", len(feed.Items))
 
-	// Process each item sequentially with a small delay to avoid rate-limits
 	for _, item := range feed.Items {
 		scrapeAndStore(item)
-		time.Sleep(2 * time.Second) // polite crawl delay
+		time.Sleep(2 * time.Second)
 	}
+
 	log.Println("Scraping cycle completed.")
 }
 
-// scrapeAndStore resolves the real article URL, scrapes its full content and
-// image, then persists the record. It falls back to the RSS snippet when the
-// live page cannot be scraped.
 func scrapeAndStore(item *gofeed.Item) {
 	if pool == nil {
 		return
 	}
 
 	realURL := resolveGoogleURL(item.Link)
-if strings.Contains(realURL, "news.google.com") {
-	log.Printf("Skip unresolved Google News URL, not storing RSS wrapper: %s", item.Title)
-	return
-}
+
+	if strings.Contains(realURL, "news.google.com") {
+		log.Printf("Skip unresolved Google News URL, not storing RSS wrapper: %s", item.Title)
+		return
+	}
+
 	var existingRealID int
+
 	err := pool.QueryRow(context.Background(),
 		"SELECT id FROM news WHERE publisher_url = $1",
 		realURL).Scan(&existingRealID)
 
-	if err == nil && !strings.Contains(realURL, "news.google.com") {
+	if err == nil {
 		log.Printf("Skip real URL already stored: %s", item.Title)
 		return
 	}
 
 	var existingGoogleID int
+
 	err = pool.QueryRow(context.Background(),
 		"SELECT id FROM news WHERE publisher_url = $1",
 		item.Link).Scan(&existingGoogleID)
@@ -522,15 +592,15 @@ if strings.Contains(realURL, "news.google.com") {
 	title := stripHTML(item.Title)
 	content = strings.TrimSpace(content)
 
-	if hasOldGoogleRow && !strings.Contains(realURL, "news.google.com") {
+	if hasOldGoogleRow {
 		_, err = pool.Exec(context.Background(),
 			`UPDATE news
-			 SET title = $1,
-			     content = $2,
-			     image_url = $3,
-			     publisher_url = $4,
-			     created_at = $5
-			 WHERE id = $6`,
+			    SET title = $1,
+			        content = $2,
+			        image_url = $3,
+			        publisher_url = $4,
+			        created_at = $5
+			  WHERE id = $6`,
 			title,
 			content,
 			imageURL,
@@ -561,34 +631,25 @@ if strings.Contains(realURL, "news.google.com") {
 
 	if err != nil {
 		log.Printf("DB insert error for '%s': %v", item.Title, err)
-	} else {
-		preview := content
-		if len(preview) > 80 {
-			preview = preview[:80] + "…"
-		}
-		log.Printf("Stored (%d chars): %s | %s", len(content), title, preview)
+		return
 	}
+
+	preview := content
+	if len(preview) > 80 {
+		preview = preview[:80] + "…"
+	}
+
+	log.Printf("Stored (%d chars): %s | %s", len(content), title, preview)
 }
-// scrapeArticlePage visits the given URL and extracts the article body text
-// and the primary image (og:image / twitter:image / first <img> in article).
-//
-// Strategy (in priority order):
-//  1. Paragraphs inside <article> — most semantic news sites
-//  2. Paragraphs inside common article-body class patterns
-//  3. All <p> tags as a generic fallback
-//
-// Colly follows redirects automatically, so this also handles any remaining
-// server-side redirects that the HTTP client may not have resolved yet.
+
 func scrapeArticlePage(articleURL string) (content, imageURL string) {
 	c := colly.NewCollector(
 		colly.UserAgent(chromeUA),
-		colly.MaxBodySize(5*1024*1024), // 5 MB cap
+		colly.MaxBodySize(5*1024*1024),
 	)
 
-	// Timeout so we never hang on a single page
 	c.SetRequestTimeout(15 * time.Second)
 
-	// Politely limit request rate
 	_ = c.Limit(&colly.LimitRule{
 		DomainGlob:  "*",
 		Parallelism: 1,
@@ -597,15 +658,13 @@ func scrapeArticlePage(articleURL string) (content, imageURL string) {
 
 	var paragraphs []string
 
-	// ── Primary: paragraphs strictly inside <article> ────────────────────
 	c.OnHTML("article p", func(e *colly.HTMLElement) {
 		t := strings.TrimSpace(e.Text)
-		if len(t) > 30 { // ignore very short strings (dates, captions, etc.)
+		if len(t) > 30 {
 			paragraphs = append(paragraphs, t)
 		}
 	})
 
-	// ── Secondary: common article-body class patterns ─────────────────────
 	articleBodySelectors := []string{
 		"[class*='article-body'] p",
 		"[class*='article_body'] p",
@@ -623,12 +682,15 @@ func scrapeArticlePage(articleURL string) (content, imageURL string) {
 		"[class*='main-content'] p",
 		"[itemprop='articleBody'] p",
 	}
+
 	for _, sel := range articleBodySelectors {
-		sel := sel
-		c.OnHTML(sel, func(e *colly.HTMLElement) {
+		selector := sel
+
+		c.OnHTML(selector, func(e *colly.HTMLElement) {
 			if len(paragraphs) > 0 {
-				return // already got content from <article>
+				return
 			}
+
 			t := strings.TrimSpace(e.Text)
 			if len(t) > 30 {
 				paragraphs = append(paragraphs, t)
@@ -636,43 +698,47 @@ func scrapeArticlePage(articleURL string) (content, imageURL string) {
 		})
 	}
 
-	// ── Tertiary: all <p> tags (generic fallback) ─────────────────────────
 	c.OnHTML("p", func(e *colly.HTMLElement) {
 		if len(paragraphs) > 0 {
-			return // already have content from above
+			return
 		}
+
 		t := strings.TrimSpace(e.Text)
 		if len(t) > 30 {
 			paragraphs = append(paragraphs, t)
 		}
 	})
 
-	// ── Image: og:image → twitter:image → first article <img> ────────────
 	c.OnHTML("meta[property='og:image']", func(e *colly.HTMLElement) {
 		if imageURL == "" {
 			imageURL = strings.TrimSpace(e.Attr("content"))
 		}
 	})
+
 	c.OnHTML("meta[name='og:image']", func(e *colly.HTMLElement) {
 		if imageURL == "" {
 			imageURL = strings.TrimSpace(e.Attr("content"))
 		}
 	})
+
 	c.OnHTML("meta[property='twitter:image']", func(e *colly.HTMLElement) {
 		if imageURL == "" {
 			imageURL = strings.TrimSpace(e.Attr("content"))
 		}
 	})
+
 	c.OnHTML("meta[name='twitter:image']", func(e *colly.HTMLElement) {
 		if imageURL == "" {
 			imageURL = strings.TrimSpace(e.Attr("content"))
 		}
 	})
+
 	c.OnHTML("article img[src]", func(e *colly.HTMLElement) {
 		if imageURL == "" {
 			src := strings.TrimSpace(e.Attr("src"))
-			// Skip tiny icons / tracking pixels
-			if src != "" && !strings.Contains(src, "pixel") && !strings.Contains(src, "icon") {
+			if src != "" &&
+				!strings.Contains(src, "pixel") &&
+				!strings.Contains(src, "icon") {
 				imageURL = src
 			}
 		}
@@ -686,15 +752,22 @@ func scrapeArticlePage(articleURL string) (content, imageURL string) {
 		log.Printf("Visit error %s: %v", articleURL, err)
 	}
 
-	// Deduplicate paragraphs and join
 	seen := map[string]bool{}
 	var unique []string
+
 	for _, p := range paragraphs {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+
 		if !seen[p] {
 			seen[p] = true
 			unique = append(unique, p)
 		}
 	}
+
 	content = strings.Join(unique, "\n\n")
+
 	return content, imageURL
 }
